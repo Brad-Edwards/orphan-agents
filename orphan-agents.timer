@@ -1,0 +1,12 @@
+[Unit]
+Description=Check every 10 minutes for orphaned agent subprocess trees
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=10min
+# Fire a missed run once the machine is back, rather than silently skipping it.
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

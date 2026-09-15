@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# Report agent subprocess trees that outlived the agent that launched them.
+#
+# An orphan here is a process the kernel reparented to init (ppid 1) because its
+# launcher died without signalling its process group. Plenty of legitimate
+# daemons also have ppid 1, so ppid alone is never the test. Two rules qualify a
+# process, each needing a second independent signal:
+#
+#   workload  ppid 1 + old + the command is a test/build workload an agent runs.
+#             Those never legitimately outlive their launcher.
+#   stranded  ppid 1 + old + the working directory has been deleted, and the
+#             command is an agent CLI. A long-lived agent with ppid 1 is often a
+#             deliberate detached session, so age alone would false-alarm; a cwd
+#             that no longer exists is unambiguous.
+#
+# Detect only. Killing is a destructive act on someone else's work and stays a
+# human decision.
+set -uo pipefail
+
+MIN_AGE_SECONDS="${ORPHAN_MIN_AGE_SECONDS:-1800}"
+WORKLOAD_RE='codex-linux-sandbox|/bin/nox|pytest|unittest discover|verify_all\.py|claude-linux-sandbox'
+AGENT_RE='(^|/)(claude|codex|cursor-agent)( |$)'
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/orphan-agents"
+SEEN="$STATE_DIR/reported"
+LATEST="$STATE_DIR/latest.txt"
+mkdir -p "$STATE_DIR"; touch "$SEEN"
+
+# Identify a process incarnation by pid + kernel start time, so a recycled pid
+# is never mistaken for one already reported.
+incarnation() { awk '{print $22}' "/proc/$1/stat" 2>/dev/null; }
+
+found=0
+report=""
+while read -r pid ppid age args; do
+  [ "$pid" = "$$" ] && continue
+  cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null || echo '?')
+  rule=""
+  if printf '%s' "$args" | grep -qE "$WORKLOAD_RE"; then
+    rule="workload"
+  elif [ "${cwd% (deleted)}" != "$cwd" ] && printf '%s' "$args" | grep -qE "$AGENT_RE"; then
+    rule="stranded"
+  else
+    continue
+  fi
+  key="$pid:$(incarnation "$pid")"
+  [ -z "${key#*:}" ] && continue
+  grep -qxF "$key" "$SEEN" && continue
+  hours=$(( age / 3600 )); mins=$(( (age % 3600) / 60 ))
+  report+=$(printf '\n  [%s] pid %-8s age %3dh%02dm  cwd %s\n      %.100s' "$rule" "$pid" "$hours" "$mins" "$cwd" "$args")
+  echo "$key" >> "$SEEN"
+  found=$(( found + 1 ))
+done < <(ps -eo pid=,ppid=,etimes=,args= | awk -v min="$MIN_AGE_SECONDS" '$2==1 && $3>min')
+
+# Drop state for incarnations that no longer exist, so the file cannot grow without bound.
+if [ -s "$SEEN" ]; then
+  tmp=$(mktemp); while read -r k; do p="${k%%:*}"; [ "$(incarnation "$p")" = "${k#*:}" ] && echo "$k"; done < "$SEEN" > "$tmp"; mv "$tmp" "$SEEN"
+fi
+
+[ "$found" -eq 0 ] && exit 0
+
+msg="orphaned agent process tree(s): $found — see: journalctl --user -t orphan-agents -n 50"
+{ date -Is; echo "$msg"; echo "$report"; } > "$LATEST"
+# ORPHAN_QUIET writes the report but sends no alerts, so the test suite can
+# exercise detection without notifying anyone.
+[ -n "${ORPHAN_QUIET:-}" ] && exit 0
+logger -t orphan-agents "$msg$report"
+notify-send -u critical "Orphaned agent processes" "$found found. $LATEST" 2>/dev/null || true
+if tmux list-sessions >/dev/null 2>&1; then
+  tmux list-sessions -F '#{session_name}' 2>/dev/null | while read -r s; do
+    tmux display-message -t "$s" "⚠ $msg" 2>/dev/null || true
+  done
+fi
+exit 0

@@ -1,0 +1,10 @@
+[Unit]
+Description=Report orphaned agent subprocess trees (detect only)
+Documentation=man:ps(1)
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/orphan-agent-check
+# Detection must not itself become the load it is watching for.
+Nice=10
+IOSchedulingClass=idle
